@@ -1,0 +1,139 @@
+name: trae checkin
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 北京时间 09:00-12:00 / 14:00-22:00 内每小时触发, 由 gate 计算当天随机目标时间
+    - cron: '0 1,2,3,4,6,7,8,9,10,11,12,13,14 * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: trae-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: validate secret
+        env:
+          ACCOUNTS: ${{ secrets.TRAE_ACCOUNTS }}
+        run: |
+          if [ -z "$ACCOUNTS" ]; then
+            echo "::error::未配置 TRAE_ACCOUNTS secret（格式: TOKEN#DEVICE_ID#UID#备注）"
+            exit 1
+          fi
+
+      - name: pick today's random slot
+        id: gate
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          python3 - <<'PY'
+          import datetime, hashlib, os
+          from zoneinfo import ZoneInfo
+
+          tz = ZoneInfo("Asia/Shanghai")
+          now = datetime.datetime.now(tz)
+          today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+          seed = int(hashlib.sha256(("trae-" + today.strftime("%Y-%m-%d")).encode()).hexdigest(), 16)
+
+          # 09:00-12:00 (180 分钟) + 14:00-22:00 (480 分钟), 共 660 分钟
+          minute = seed % 660
+          if minute < 180:
+              target = today.replace(hour=9) + datetime.timedelta(minutes=minute)
+          else:
+              target = today.replace(hour=14) + datetime.timedelta(minutes=minute - 180)
+
+          morning = (9 <= now.hour < 12) or (now.hour == 12 and now.minute < 1)
+          afternoon = (14 <= now.hour < 22) or (now.hour == 22 and now.minute < 1)
+          in_window = morning or afternoon
+
+          force = os.environ.get("FORCE") == "true"
+          upcoming = target < now + datetime.timedelta(hours=1)
+          skip = 0 if (force or (in_window and (now >= target or upcoming))) else 1
+          delay = 0
+          if not force and now < target:
+              delay = min(3600, max(0, int((target - now).total_seconds())))
+
+          print("target=%s now=%s in_window=%s force=%s skip=%d delay=%ds" % (
+              target.strftime("%H:%M"), now.strftime("%H:%M"), in_window, force, skip, delay))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("skip=%d\n" % skip)
+              f.write("delay=%d\n" % delay)
+              f.write("target=%s\n" % target.strftime("%H:%M"))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("- 今日随机目标: %s, 当前: %s, 本次执行: %s\n" % (
+                  target.strftime("%H:%M"), now.strftime("%H:%M"), "是" if skip == 0 else "否"))
+          PY
+
+      - name: check today's status
+        id: status
+        if: steps.gate.outputs.skip == '0'
+        continue-on-error: true
+        env:
+          ACCOUNTS: ${{ secrets.TRAE_ACCOUNTS }}
+        run: |
+          config="$(jq -n --arg accounts "$ACCOUNTS" '{accounts:$accounts, status_only:true}')"
+          echo "$config" | python3 -X utf8 channels/trae/channel.py | tee /tmp/status.log
+          result="$(grep '^__CHECKIN_RESULT__' /tmp/status.log | tail -n 1 | sed 's/^__CHECKIN_RESULT__//')"
+          if echo "$result" | jq -e '.data.checked_in == true' >/dev/null 2>&1; then
+            checked="true"
+          elif echo "$result" | jq -e '.data.checked_in == false' >/dev/null 2>&1; then
+            checked="false"
+          else
+            checked="unknown"
+          fi
+          echo "checked=$checked" >> "$GITHUB_OUTPUT"
+
+      - name: wait for random slot
+        if: steps.gate.outputs.skip == '0' && steps.status.outputs.checked == 'false' && steps.gate.outputs.delay != '0'
+        env:
+          DELAY: ${{ steps.gate.outputs.delay }}
+        run: |
+          python3 - <<'PY'
+          import os, time
+          delay = int(os.environ.get("DELAY") or "0")
+          print("等待 %d 秒到达今日随机时间" % delay)
+          if delay > 0:
+              time.sleep(delay)
+          PY
+
+      - name: run trae checkin
+        if: steps.gate.outputs.skip == '0' && steps.status.outputs.checked != 'true'
+        env:
+          ACCOUNTS: ${{ secrets.TRAE_ACCOUNTS }}
+        run: |
+          jq -n --arg accounts "$ACCOUNTS" '{accounts:$accounts}' \
+          | python3 -X utf8 channels/trae/channel.py | tee /tmp/checkin.log
+
+          result="$(grep '^__CHECKIN_RESULT__' /tmp/checkin.log | tail -n 1 | sed 's/^__CHECKIN_RESULT__//')"
+          if [ -z "$result" ]; then
+            echo "::error::脚本未输出结构化结果"
+            exit 1
+          fi
+          echo "$result" | jq .
+          if ! echo "$result" | jq -e '.success == true' >/dev/null; then
+            echo "::error::签到失败: $(echo "$result" | jq -r '.message')"
+            exit 1
+          fi
+
+      - name: keep alive
+        if: always() && github.event_name == 'schedule'
+        uses: liskin/gh-workflow-keepalive@v1
+
+      - name: delete old runs
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 7
+          keep_minimum_runs: 7
+          delete_run_by_conclusion_pattern: ALL

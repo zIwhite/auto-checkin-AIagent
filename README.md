@@ -52,6 +52,7 @@ python app.py
 | 渠道 | 说明 |
 |---|---|
 | `workbuddy` | WorkBuddy（腾讯 CodeBuddy）每日积分签到，支持多账号、WxPusher 微信推送，详见 `docs/WorkBuddy自动签到配置说明.md` |
+| `trae` | Trae CN / TRAE SOLO CN 每日签到，需要真实设备号与 token，详见 `channels/trae/README.md` |
 | `modelscope` | ModelScope 每日登录奖励，填站点 Cookie 即可，支持查询魔方余额 |
 | `qoder` | Qoder 每日积分签到，支持 PAT / 会话令牌、国内版与国际版 |
 | `example_demo` | 本地模拟签到（不联网），用于测试平台与演示接入方式，可删除 |
