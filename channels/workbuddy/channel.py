@@ -217,7 +217,7 @@ def query_checked(token, uid):
     checkin_url, _ = endpoints(token)
     status_url = checkin_url.rsplit("/", 1)[0] + "/checkin-activity-status"
     status, body = post_json(status_url, token, uid)
-    if status != 200:
+    if status == 0 or not body:
         return None
     try:
         obj = json.loads(body)
