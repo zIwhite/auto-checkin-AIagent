@@ -3,8 +3,8 @@ name: workbuddy checkin
 on:
   workflow_dispatch:
   schedule:
-    # UTC 01:30 / 12:30 = 北京时间 09:30 / 20:30
-    - cron: '30 1,12 * * *'
+    # 北京时间 09:00-12:00 / 14:00-22:00 内每小时触发, 由 gate 计算当天随机目标时间
+    - cron: '0 1,2,3,4,6,7,8,9,10,11,12,13,14 * * *'
 
 # keepalive 需要 actions:write; checkout 需要 contents:read
 permissions:
@@ -18,20 +18,102 @@ concurrency:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
 
-      - name: run workbuddy checkin
+      - name: validate secret
         env:
           ACCOUNTS: ${{ secrets.WORKBUDDY_ACCOUNTS }}
-          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
-          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
         run: |
           if [ -z "$ACCOUNTS" ]; then
             echo "::error::未配置 WORKBUDDY_ACCOUNTS secret（格式: ACCESS_TOKEN#UID#备注）"
             exit 1
           fi
+
+      - name: pick today's random slot
+        id: gate
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          python3 - <<'PY'
+          import datetime, hashlib, os
+          from zoneinfo import ZoneInfo
+
+          tz = ZoneInfo("Asia/Shanghai")
+          now = datetime.datetime.now(tz)
+          today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+          seed = int(hashlib.sha256(("workbuddy-" + today.strftime("%Y-%m-%d")).encode()).hexdigest(), 16)
+
+          # 09:00-12:00 (180 分钟) + 14:00-22:00 (480 分钟), 共 660 分钟
+          minute = seed % 660
+          if minute < 180:
+              target = today.replace(hour=9) + datetime.timedelta(minutes=minute)
+          else:
+              target = today.replace(hour=14) + datetime.timedelta(minutes=minute - 180)
+
+          # 允许整点边界(12:00 / 22:00)作为延迟补跑
+          morning = (9 <= now.hour < 12) or (now.hour == 12 and now.minute < 1)
+          afternoon = (14 <= now.hour < 22) or (now.hour == 22 and now.minute < 1)
+          in_window = morning or afternoon
+
+          force = os.environ.get("FORCE") == "true"
+          upcoming = target < now + datetime.timedelta(hours=1)
+          skip = 0 if (force or (in_window and (now >= target or upcoming))) else 1
+          delay = 0
+          if not force and now < target:
+              delay = min(3600, max(0, int((target - now).total_seconds())))
+
+          print("target=%s now=%s in_window=%s force=%s skip=%d delay=%ds" % (
+              target.strftime("%H:%M"), now.strftime("%H:%M"), in_window, force, skip, delay))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("skip=%d\n" % skip)
+              f.write("delay=%d\n" % delay)
+              f.write("target=%s\n" % target.strftime("%H:%M"))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("- 今日随机目标: %s, 当前: %s, 本次执行: %s\n" % (
+                  target.strftime("%H:%M"), now.strftime("%H:%M"), "是" if skip == 0 else "否"))
+          PY
+
+      - name: check today's status
+        id: status
+        if: steps.gate.outputs.skip == '0'
+        continue-on-error: true
+        env:
+          ACCOUNTS: ${{ secrets.WORKBUDDY_ACCOUNTS }}
+        run: |
+          config="$(jq -n --arg accounts "$ACCOUNTS" '{accounts:$accounts, status_only:true}')"
+          echo "$config" | python3 -X utf8 channels/workbuddy/channel.py | tee /tmp/status.log
+          result="$(grep '^__CHECKIN_RESULT__' /tmp/status.log | tail -n 1 | sed 's/^__CHECKIN_RESULT__//')"
+          if echo "$result" | jq -e '.data.checked_in == true' >/dev/null 2>&1; then
+            checked="true"
+          elif echo "$result" | jq -e '.data.checked_in == false' >/dev/null 2>&1; then
+            checked="false"
+          else
+            checked="unknown"
+          fi
+          echo "checked=$checked" >> "$GITHUB_OUTPUT"
+
+      - name: wait for random slot
+        if: steps.gate.outputs.skip == '0' && steps.status.outputs.checked == 'false' && steps.gate.outputs.delay != '0'
+        env:
+          DELAY: ${{ steps.gate.outputs.delay }}
+        run: |
+          python3 - <<'PY'
+          import os, time
+          delay = int(os.environ.get("DELAY") or "0")
+          print("等待 %d 秒到达今日随机时间" % delay)
+          if delay > 0:
+              time.sleep(delay)
+          PY
+
+      - name: run workbuddy checkin
+        if: steps.gate.outputs.skip == '0' && steps.status.outputs.checked != 'true'
+        env:
+          ACCOUNTS: ${{ secrets.WORKBUDDY_ACCOUNTS }}
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+        run: |
           jq -n \
             --arg accounts "$ACCOUNTS" \
             --arg app_token "$WXPUSHER_APP_TOKEN" \
@@ -53,7 +135,7 @@ jobs:
           fi
 
       - name: keep alive
-        if: github.event_name == 'schedule'
+        if: always() && github.event_name == 'schedule'
         uses: liskin/gh-workflow-keepalive@v1
 
       - name: delete old runs

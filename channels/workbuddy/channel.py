@@ -29,7 +29,7 @@ WXPUSHER_API = "https://wxpusher.zjiecode.com/api/send/message"
 
 META = {
     "name": "WorkBuddy 每日积分签到",
-    "version": "1.3.0",
+    "version": "1.4.0",
     "author": "xuwangcheng",
     "description": "WorkBuddy(腾讯 CodeBuddy) 每日签到领积分。支持多账号; 留空账号配置时自动读取本机客户端登录文件。",
     "config_schema": [
@@ -194,6 +194,38 @@ def parse_result(status, body):
     return False, "签到失败 status=%s code=%s msg=%s" % (status, code, msg), None
 
 
+def _find_bool(obj, keys):
+    """在嵌套响应里找第一个布尔字段(兼容不同版本的 data 结构)。"""
+    if isinstance(obj, dict):
+        for key in keys:
+            if isinstance(obj.get(key), bool):
+                return obj[key]
+        for value in obj.values():
+            found = _find_bool(value, keys)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_bool(value, keys)
+            if found is not None:
+                return found
+    return None
+
+
+def query_checked(token, uid):
+    """查询今日是否已签到。返回 True/False, 查询失败返回 None。"""
+    checkin_url, _ = endpoints(token)
+    status_url = checkin_url.rsplit("/", 1)[0] + "/checkin-activity-status"
+    status, body = post_json(status_url, token, uid)
+    if status != 200:
+        return None
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        return None
+    return _find_bool(obj, ("today_checked_in", "todayCheckedIn", "checked_in"))
+
+
 def query_balance(token, uid, url):
     status, body = post_json(url, token, uid, RESOURCE_BODY)
     if status != 200:
@@ -285,6 +317,21 @@ def run(config):
         else:
             message += ": 请在任务配置中填写账号列表, 或在本机登录 WorkBuddy 客户端"
         return {"success": False, "message": message}
+
+    if config.get("status_only"):
+        # 供 GitHub Actions 随机时间门控使用: 只查今日是否已签到, 不发签到请求
+        results = []
+        for acc in accounts:
+            checked = query_checked(acc["token"], acc["uid"])
+            state = "已签到" if checked is True else "未签到" if checked is False else "未知"
+            log("账号[%s] 今日签到状态: %s" % (acc["remark"], state))
+            results.append({"remark": acc["remark"], "checked_in": checked})
+        all_checked = all(r["checked_in"] is True for r in results)
+        return {
+            "success": True,
+            "message": "今日已签到" if all_checked else "今日未签到",
+            "data": {"checked_in": all_checked, "accounts": results},
+        }
 
     log("共加载 %d 个账号, 开始签到%s" % (len(accounts), " [dry-run]" if dry else ""))
     results = [run_account(acc, dry) for acc in accounts]
