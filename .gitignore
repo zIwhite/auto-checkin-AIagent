@@ -27,3 +27,8 @@ docs/部署与运维.md
 *.log
 .DS_Store
 Thumbs.db
+
+# 上传目录与临时提取脚本(含用户凭据, 严禁提交)
+.uploads/
+WB_extract.py
+WB_get_Token.py

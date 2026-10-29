@@ -17,10 +17,12 @@ import datetime
 import json
 import os
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 ENDPOINT_CHECKIN = "https://copilot.tencent.com/v2/billing/meter/daily-checkin"
 ENDPOINT_RESOURCE = "https://copilot.tencent.com/v2/billing/meter/get-user-resource"
+DEFAULT_API_BASE = "https://copilot.tencent.com"
 RESOURCE_BODY = {"PageNumber": 1, "PageSize": 100, "ProductCode": "p_tcaca",
                  "Status": [0, 3], "OnlyValidPeriod": True}
 WXPUSHER_API = "https://wxpusher.zjiecode.com/api/send/message"
@@ -109,15 +111,35 @@ def load_accounts(config, notes=None):
     return []
 
 
-def decode_exp(token):
-    """从 JWT 解析 exp 字段, 失败返回 None。"""
+def decode_payload(token):
+    """解析 JWT payload, 失败返回空字典。"""
     try:
         part = token.split(".")[1]
         part += "=" * (-len(part) % 4)
         payload = json.loads(base64.urlsafe_b64decode(part).decode("utf-8", "replace"))
-        return payload.get("exp")
+        return payload if isinstance(payload, dict) else {}
     except Exception:
-        return None
+        return {}
+
+
+def decode_exp(token):
+    """从 JWT 解析 exp 字段, 失败返回 None。"""
+    return decode_payload(token).get("exp")
+
+
+def api_base(token):
+    """接口域名以令牌 issuer 为准(如 www.workbuddy.cn), 缺省回落到 copilot.tencent.com。"""
+    iss = str(decode_payload(token).get("iss") or "")
+    if "://" in iss:
+        host = urlparse(iss).netloc
+        if host:
+            return "https://" + host
+    return DEFAULT_API_BASE
+
+
+def endpoints(token):
+    base = api_base(token)
+    return base + "/v2/billing/meter/daily-checkin", base + "/v2/billing/meter/get-user-resource"
 
 
 def post_json(url, token, uid, body_obj=None):
@@ -172,8 +194,8 @@ def parse_result(status, body):
     return False, "签到失败 status=%s code=%s msg=%s" % (status, code, msg), None
 
 
-def query_balance(token, uid):
-    status, body = post_json(ENDPOINT_RESOURCE, token, uid, RESOURCE_BODY)
+def query_balance(token, uid, url):
+    status, body = post_json(url, token, uid, RESOURCE_BODY)
     if status != 200:
         return None
     try:
@@ -211,14 +233,17 @@ def run_account(acc, dry):
                 "before": None, "after": None, "gained": None,
                 "expires_at": expires_at}
 
-    before = query_balance(token, uid)
+    checkin_url, resource_url = endpoints(token)
+    log("账号[%s] 接口域名: %s" % (remark, urlparse(checkin_url).netloc))
+
+    before = query_balance(token, uid, resource_url)
     log("账号[%s] 签到前总积分: %s" % (remark, "未知" if before is None else before))
 
-    status, body = post_json(ENDPOINT_CHECKIN, token, uid)
+    status, body = post_json(checkin_url, token, uid)
     ok, msg, awarded = parse_result(status, body)
     log("账号[%s] %s %s" % (remark, "✅" if ok else "❌", msg))
 
-    after = query_balance(token, uid)
+    after = query_balance(token, uid, resource_url)
     log("账号[%s] 签到后总积分: %s" % (remark, "未知" if after is None else after))
 
     if awarded is not None:
